@@ -26,7 +26,7 @@ from .multilspy_config import MultilspyConfig, Language
 from .multilspy_exceptions import MultilspyException
 from .multilspy_utils import PathUtils, FileUtils, TextUtils
 from pathlib import PurePath
-from typing import AsyncIterator, Iterator, List, Dict, Union, Tuple
+from typing import AsyncIterator, Iterator, List, Dict, Union, Tuple, Any
 from .type_helpers import ensure_all_methods_implemented
 
 
@@ -270,6 +270,58 @@ class LanguageServer:
         new_l, new_c = TextUtils.get_updated_position_from_line_and_column_and_edit(line, column, text_to_be_inserted)
         return multilspy_types.Position(line=new_l, character=new_c)
 
+    
+    def request_rename(
+        self, relative_file_path: str, line: int, column: int, text_to_be_inserted: str
+    ) -> Any:
+        """
+        Insert text at the given line and column in the given file and return 
+        the updated cursor position after inserting the text.
+
+        :param relative_file_path: The relative path of the file to open.
+        :param line: The line number at which text should be inserted.
+        :param column: The column number at which text should be inserted.
+        :param text_to_be_inserted: The text to insert.
+        """
+        if not self.server_started:
+            self.logger.log(
+                "insert_text_at_position called before Language Server started",
+                logging.ERROR,
+            )
+            raise MultilspyException("Language Server not started")
+
+        absolute_file_path = str(PurePath(self.repository_root_path, relative_file_path))
+        uri = pathlib.Path(absolute_file_path).as_uri()
+
+        # Ensure the file is open
+        assert uri in self.open_file_buffers
+
+        file_buffer = self.open_file_buffers[uri]
+        file_buffer.version += 1
+        change_index = TextUtils.get_index_from_line_col(file_buffer.contents, line, column)
+        file_buffer.contents = (
+            file_buffer.contents[:change_index] + text_to_be_inserted + file_buffer.contents[change_index:]
+        )
+        self.server.notify.did_change_text_document(
+            {
+                LSPConstants.TEXT_DOCUMENT: {
+                    LSPConstants.VERSION: file_buffer.version,
+                    LSPConstants.URI: file_buffer.uri,
+                },
+                LSPConstants.CONTENT_CHANGES: [
+                    {
+                        LSPConstants.RANGE: {
+                            "start": {"line": line, "character": column},
+                            "end": {"line": line, "character": column},
+                        },
+                        "text": text_to_be_inserted,
+                    }
+                ],
+            }
+        )
+        new_l, new_c = TextUtils.get_updated_position_from_line_and_column_and_edit(line, column, text_to_be_inserted)
+        return multilspy_types.Position(line=new_l, character=new_c)
+
     def delete_text_between_positions(
         self,
         relative_file_path: str,
@@ -413,6 +465,45 @@ class LanguageServer:
             assert False, f"Unexpected response from Language Server: {response}"
 
         return ret
+
+    async def request_rename(
+        self, relative_file_path: str, line: int, column: int, new_name: str
+    ) -> Any:
+        """
+        Raise a [textDocument/definition](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_definition) request to the Language Server
+        for the symbol at the given line and column in the given file. Wait for the response and return the result.
+
+        :param relative_file_path: The relative path of the file that has the symbol for which definition should be looked up
+        :param line: The line number of the symbol
+        :param column: The column number of the symbol
+
+        :return List[multilspy_types.Location]: A list of locations where the symbol is defined
+        """
+
+        if not self.server_started:
+            self.logger.log(
+                "find_function_definition called before Language Server started",
+                logging.ERROR,
+            )
+            raise MultilspyException("Language Server not started")
+
+        with self.open_file(relative_file_path):
+            # sending request to the language server and waiting for response
+            response = await self.server.send.rename(
+                {
+                    LSPConstants.TEXT_DOCUMENT: {
+                        LSPConstants.URI: pathlib.Path(
+                            str(PurePath(self.repository_root_path, relative_file_path))
+                        ).as_uri()
+                    },
+                    LSPConstants.POSITION: {
+                        LSPConstants.LINE: line,
+                        LSPConstants.CHARACTER: column,
+                    },
+                    "newName": new_name
+                }
+            )
+            return response
 
     async def request_references(
         self, relative_file_path: str, line: int, column: int
@@ -801,5 +892,11 @@ class SyncLanguageServer:
         """
         result = asyncio.run_coroutine_threadsafe(
             self.language_server.request_hover(relative_file_path, line, column), self.loop
+        ).result()
+        return result
+
+    def request_rename(self, relative_file_path: str, line: int, column: int, new_name: str) -> Any:
+        result = asyncio.run_coroutine_threadsafe(
+            self.language_server.request_rename(relative_file_path, line, column, new_name), self.loop
         ).result()
         return result
